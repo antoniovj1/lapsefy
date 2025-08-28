@@ -3,8 +3,8 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QLabel, QSlider, QSpinBox,
                                QFileDialog, QComboBox, QGroupBox, QStatusBar, QMessageBox,
                                QSplitter, QProgressBar, QApplication)
-from PySide6.QtCore import Qt, QSize, QEvent, QTimer
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtCore import Qt, QSize, QEvent, QTimer, Signal
+from PySide6.QtGui import QIcon, QAction, QImage, QPixmap
 from .preview_widget import PreviewWidget
 from .thumbnail_view import ThumbnailView
 from .deflicker_dialog import DeflickerDialog
@@ -13,6 +13,23 @@ from app.core.video_exporter import VideoExporter
 from app.core.deflicker import Deflickerer
 import os
 import threading
+
+# Añadir al inicio del archivo
+import json
+from scipy import signal
+try:
+    import pywt
+    HAS_PYWT = True
+except ImportError:
+    HAS_PYWT = False
+    print("Advertencia: PyWavelets no está instalado. El suavizado wavelet no estará disponible.")
+
+try:
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+    print("Advertencia: statsmodels no está instalado. El suavizado LOESS no estará disponible.")
 import numpy as np
 
 # --- Eventos Personalizados ---
@@ -65,6 +82,8 @@ class DeflickerErrorEvent(QEvent):
 
 
 class MainWindow(QMainWindow):
+    deflicker_preview_ready = Signal(int, QImage)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lapsefy")
@@ -91,6 +110,11 @@ class MainWindow(QMainWindow):
 
         # Inicializar procesador
         self.processor = ImageProcessor()
+        self.deflicker_dialog = None
+        self.deflicker_preview_ready.connect(self.on_deflicker_preview_ready)
+
+        # self.deflicker_preview_ready.connect(self.handle_deflicker_preview)
+        # print("Señal deflicker_preview_ready conectada")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -263,6 +287,13 @@ class MainWindow(QMainWindow):
         if image_paths:
             image_paths.sort()
             self.on_images_loaded(image_paths)
+
+    def on_deflicker_preview_ready(self, frame_idx, qt_image):
+        """Manejar la previsualización lista para el diálogo de deflicker"""
+        # Esta función debería comunicarse con el diálogo abierto
+        # Para simplificar, podríamos mantener una referencia al diálogo
+        if hasattr(self, 'deflicker_dialog') and self.deflicker_dialog.isVisible():
+            self.deflicker_dialog.update_preview_display(frame_idx, qt_image)
 
     def on_images_loaded(self, image_sequence):
         if image_sequence:
@@ -449,7 +480,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", "No se pudo generar la curva de brillo.")
             return
 
-        dialog = DeflickerDialog(curve, self)
+        dialog = DeflickerDialog(curve, self.image_sequence, self)
         if dialog.exec():
             smoothing_level = dialog.get_smoothing_level()
             self.status_bar.showMessage("Aplicando corrección de deflicker...")
@@ -547,3 +578,64 @@ class MainWindow(QMainWindow):
         else:
             self.status_bar.showMessage("Error al exportar", 5000)
             QMessageBox.critical(self, "Error", message)
+
+    def show_deflicker_dialog(self):
+        if not self.image_sequence:
+            QMessageBox.warning(self, "Advertencia", "Primero debe importar una secuencia de imágenes.")
+            return
+
+        # Verificar si ya tenemos la curva de brillo calculada
+        if not self.deflickerer.brightness_curve:
+            self.status_bar.showMessage("Analizando brillo de la secuencia...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.set_ui_enabled(False)
+
+            def calculate_curve_thread():
+                try:
+                    curve = self.deflickerer.get_brightness_curve(self.image_sequence)
+                    QApplication.instance().postEvent(self, DeflickerCurveReadyEvent(curve))
+                except Exception as e:
+                    error_message = f"Error al calcular la curva de brillo: {e}"
+                    QApplication.instance().postEvent(self, DeflickerErrorEvent(error_message))
+
+            threading.Thread(target=calculate_curve_thread, daemon=True).start()
+        else:
+            # Si ya tenemos la curva, mostrar el diálogo directamente
+            self._show_deflicker_dialog()
+
+    def _show_deflicker_dialog(self):
+        """Muestra el diálogo de deflicker con la curva calculada"""
+        self.deflicker_dialog = DeflickerDialog(
+            self.deflickerer.brightness_curve,
+            self.image_sequence,
+            self
+        )
+        # Conectar las señales del diálogo
+        # self.deflicker_dialog.preview_updated.connect(self.on_deflicker_preview_requested)
+        # print("Señal preview_updated conectada correctamente")
+
+        if self.deflicker_dialog.exec():
+            smoothing_level = self.deflicker_dialog.get_smoothing_level()
+            smoothed_curve = self.deflicker_dialog.get_smoothed_curve()
+
+            self.status_bar.showMessage("Aplicando corrección de deflicker...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.set_ui_enabled(False)
+
+            def apply_correction_thread():
+                try:
+                    self.processed_sequence = self.deflickerer.apply_correction(
+                        self.image_sequence,
+                        smoothed_curve
+                    )
+                    QApplication.instance().postEvent(self, DeflickerFinishedEvent())
+                except Exception as e:
+                    error_message = f"Error al aplicar la corrección: {e}"
+                    QApplication.instance().postEvent(self, DeflickerErrorEvent(error_message))
+
+            threading.Thread(target=apply_correction_thread, daemon=True).start()
+
+        # Limpiar referencia al diálogo
+        self.deflicker_dialog = None
