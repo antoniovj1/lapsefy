@@ -1,7 +1,7 @@
 # app/ui/preview_widget.py
 from PySide6.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QStackedLayout
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap, QFont
+from PySide6.QtGui import QImage, QPixmap, QFont, QPainter
 import cv2
 import numpy as np
 import os
@@ -92,12 +92,34 @@ class PreviewWidget(QWidget):
 
     def update_pixmap_scaling(self):
         if self.current_pixmap:
+            # Get label size without margins
+            label_size = self.image_label.size()
+
+            # Calculate scaled size maintaining aspect ratio
+            pixmap_size = self.current_pixmap.size()
+            pixmap_size.scale(label_size, Qt.KeepAspectRatio)
+
+            # Scale the pixmap
             scaled_pixmap = self.current_pixmap.scaled(
-                self.image_label.size(),
+                pixmap_size,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-            self.image_label.setPixmap(scaled_pixmap)
+
+            # Create a transparent pixmap of exactly the label size
+            final_pixmap = QPixmap(label_size)
+            final_pixmap.fill(Qt.transparent)
+
+            # Calculate position to center the scaled pixmap
+            x = (label_size.width() - pixmap_size.width()) // 2
+            y = (label_size.height() - pixmap_size.height()) // 2
+
+            # Paint the scaled pixmap onto the transparent pixmap
+            painter = QPainter(final_pixmap)
+            painter.drawPixmap(x, y, scaled_pixmap)
+            painter.end()
+
+            self.image_label.setPixmap(final_pixmap)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

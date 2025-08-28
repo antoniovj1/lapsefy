@@ -25,18 +25,25 @@ class ImageProcessor:
         try:
             if image_path.lower().endswith(('.raw', '.cr2', '.nef', '.arw', '.raf')):
                 with rawpy.imread(image_path) as raw:
-                    # --- CAMBIO REALIZADO: Corrección de color avanzada ---
-                    # Se aplica un espacio de color sRGB y una corrección gamma
-                    # para obtener colores vibrantes y fieles a la cámara,
-                    # similar a lo que hace el JPEG de la miniatura.
-                    rgb = raw.postprocess(
-                        use_camera_wb=True,
-                        no_auto_bright=True,
-                        output_color=rawpy.ColorSpace.sRGB,
-                        gamma=(2.222, 4.5),
-                        output_bps=8
-                    )
-                image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    # Use the same processing as thumbnails
+                    try:
+                        # Try to extract embedded thumbnail first (like thumbnails do)
+                        thumb = raw.extract_thumb()
+                        if thumb.format == rawpy.ThumbFormat.JPEG:
+                            image_data = np.frombuffer(thumb.data, np.uint8)
+                            image = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+                        else:
+                            raise rawpy.LibRawNoThumbnailError()
+                    except rawpy.LibRawNoThumbnailError:
+                        # Fall back to full development with matching parameters
+                        rgb = raw.postprocess(
+                            use_camera_wb=True,
+                            no_auto_bright=True,
+                            output_color=rawpy.ColorSpace.sRGB,
+                            gamma=(2.4, 4.5),  # Slightly different gamma for better vibrancy
+                            output_bps=8
+                        )
+                        image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             else:
                 image = cv2.imread(image_path)
 
