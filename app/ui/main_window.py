@@ -1,20 +1,47 @@
+import cv2
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QLabel, QSlider, QSpinBox, QDoubleSpinBox,
+                               QPushButton, QLabel, QSlider, QSpinBox,
                                QFileDialog, QComboBox, QGroupBox, QStatusBar, QMessageBox,
                                QSplitter, QProgressBar, QApplication)
-from PySide6.QtCore import Qt, QSize, QEvent
+from PySide6.QtCore import Qt, QSize, QEvent, QTimer
 from PySide6.QtGui import QIcon, QAction
 from .preview_widget import PreviewWidget
 from .thumbnail_view import ThumbnailView
 from app.core.image_processor import ImageProcessor
 from app.core.video_exporter import VideoExporter
-from app.core.export_thread import ExportThread
 from app.core.deflicker import Deflickerer
-from app.core.image_loader import ImageLoader  # Añadir esta importación
-from app.core.image_processor_thread import ImageProcessorThread  # Añadir esta importación
-import time
+from app.core.image_loader import ImageLoader
 import os
 import threading
+import numpy as np
+
+# Registrar tipos de eventos personalizados
+PreviewUpdateEventType = QEvent.registerEventType()
+StatusUpdateEventType = QEvent.registerEventType()
+ExportFinishedEventType = QEvent.registerEventType()
+
+
+class PreviewUpdateEvent(QEvent):
+    def __init__(self, image, filename, width, height):
+        super().__init__(QEvent.Type(PreviewUpdateEventType))
+        self.image = image
+        self.filename = filename
+        self.width = width
+        self.height = height
+
+
+class StatusUpdateEvent(QEvent):
+    def __init__(self, message, progress):
+        super().__init__(QEvent.Type(StatusUpdateEventType))
+        self.message = message
+        self.progress = progress
+
+
+class ExportFinishedEvent(QEvent):
+    def __init__(self, success, message):
+        super().__init__(QEvent.Type(ExportFinishedEventType))
+        self.success = success
+        self.message = message
 
 
 class MainWindow(QMainWindow):
@@ -26,11 +53,16 @@ class MainWindow(QMainWindow):
         # Variables de estado
         self.image_sequence = []
         self.current_frame_index = 0
-        self.processed_sequence = []  # Solo se usará durante la exportación
+        self.processed_sequence = []
 
         # Ajustes actuales
         self.current_exposure = 0.0
         self.current_contrast = 0.0
+
+        # Timer para procesamiento diferido
+        self.preview_timer = QTimer()
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self.process_current_image)
 
         # Inicializar componentes
         self.init_ui()
@@ -38,12 +70,6 @@ class MainWindow(QMainWindow):
 
         # Inicializar procesador
         self.processor = ImageProcessor()
-        self.processor_thread = ImageProcessorThread()
-        self.processor_thread.processing_done.connect(self.on_processing_done)
-        self.processor_thread.processing_error.connect(self.on_processing_error)
-        self.last_processing_time = 0
-        self.pending_processing = False
-        self.current_processing_id = 0
 
     def init_ui(self):
         # Widget central y layout principal
@@ -100,8 +126,7 @@ class MainWindow(QMainWindow):
         self.exposure_slider = QSlider(Qt.Horizontal)
         self.exposure_slider.setRange(-100, 100)
         self.exposure_slider.setValue(0)
-
-        self.exposure_slider.valueChanged.connect(self.update_preview_only)
+        self.exposure_slider.valueChanged.connect(self.slider_changed)
         exposure_layout.addWidget(self.exposure_slider)
         settings_layout.addLayout(exposure_layout)
 
@@ -111,8 +136,7 @@ class MainWindow(QMainWindow):
         self.contrast_slider = QSlider(Qt.Horizontal)
         self.contrast_slider.setRange(-100, 100)
         self.contrast_slider.setValue(0)
-
-        self.contrast_slider.valueChanged.connect(self.update_preview_only)
+        self.contrast_slider.valueChanged.connect(self.slider_changed)
         contrast_layout.addWidget(self.contrast_slider)
         settings_layout.addLayout(contrast_layout)
 
@@ -195,7 +219,6 @@ class MainWindow(QMainWindow):
         self.thumbnail_view = ThumbnailView()
         self.thumbnail_view.thumbnail_clicked.connect(self.on_thumbnail_clicked)
 
-
         # Añadir widgets al splitter
         splitter.addWidget(top_widget)
         splitter.addWidget(self.thumbnail_view)
@@ -241,6 +264,8 @@ class MainWindow(QMainWindow):
         self.resolution_combo.setEnabled(enabled)
         self.codec_combo.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
+        self.prev_button.setEnabled(enabled)
+        self.next_button.setEnabled(enabled)
 
     def init_menu(self):
         menubar = self.menuBar()
@@ -314,6 +339,7 @@ class MainWindow(QMainWindow):
 
             # Habilitar UI
             self.set_ui_enabled(True)
+            self.update_navigation_buttons()
         else:
             QMessageBox.warning(self, "Error", "No se encontraron imágenes válidas en la carpeta seleccionada")
             self.status_bar.showMessage("No se encontraron imágenes válidas")
@@ -334,30 +360,61 @@ class MainWindow(QMainWindow):
         self.prev_button.setEnabled(has_images and self.current_frame_index > 0)
         self.next_button.setEnabled(has_images and self.current_frame_index < len(self.image_sequence) - 1)
 
-    def apply_adjustments(self):
-        if self.image_sequence:
-            exposure = self.exposure_slider.value() / 100.0
-            contrast = self.contrast_slider.value() / 100.0
+    def slider_changed(self):
+        """Maneja el cambio en los sliders"""
+        # Actualizar valores actuales
+        self.current_exposure = self.exposure_slider.value() / 100.0
+        self.current_contrast = self.contrast_slider.value() / 100.0
 
-            # Procesar imagen actual con los ajustes
-            processor = ImageProcessor()
-            adjusted_image = processor.adjust_image(
-                self.image_sequence[self.current_frame_index],
-                exposure,
-                contrast
-            )
+        # Reiniciar el timer para procesamiento diferido
+        self.preview_timer.stop()
+        self.preview_timer.start(300)  # 300 ms de delay
 
-            self.preview_widget.set_image(adjusted_image)
+    def process_current_image(self):
+        """Procesa la imagen actual con los ajustes actuales"""
+        if not self.image_sequence or self.current_frame_index >= len(self.image_sequence):
+            return
+
+        image_path = self.image_sequence[self.current_frame_index]
+        exposure = self.current_exposure
+        contrast = self.current_contrast
+
+        # Procesar en un hilo para no bloquear la UI
+        threading.Thread(target=self.process_preview_image,
+                         args=(image_path, exposure, contrast),
+                         daemon=True).start()
+
+    def process_preview_image(self, image_path, exposure, contrast):
+        """Procesa una imagen para previsualización en un hilo secundario"""
+        try:
+            # Procesar la imagen
+            processed_image = self.processor.adjust_image(image_path, exposure, contrast)
+
+            # Redimensionar para previsualización si es muy grande
+            max_width = 800
+            if processed_image.shape[1] > max_width:
+                scale = max_width / processed_image.shape[1]
+                new_width = max_width
+                new_height = int(processed_image.shape[0] * scale)
+                processed_image = cv2.resize(processed_image, (new_width, new_height))
+
+            # Actualizar la UI en el hilo principal
+            if processed_image is not None:
+                QApplication.instance().postEvent(
+                    self,
+                    PreviewUpdateEvent(processed_image, os.path.basename(image_path),
+                                       processed_image.shape[1], processed_image.shape[0])
+                )
+        except Exception as e:
+            print(f"Error en procesamiento de previsualización: {e}")
 
     def on_thumbnail_clicked(self, image_path):
         """Maneja el clic en una miniatura para mostrar la imagen en grande"""
-        # Encontrar el índice de la imagen en la secuencia
         try:
             index = self.image_sequence.index(image_path)
             self.current_frame_index = index
             self.show_current_frame()
         except ValueError:
-            # Si no se encuentra la ruta (no debería pasar), mostrar mensaje de error
             QMessageBox.warning(self, "Error", "No se pudo cargar la imagen seleccionada")
 
     def apply_deflicker(self):
@@ -382,7 +439,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.deflicker_error(str(e))
 
-        thread = threading.Thread(target=deflicker_thread)
+        thread = threading.Thread(target=deflicker_thread, daemon=True)
         thread.start()
 
     def deflicker_finished(self):
@@ -452,7 +509,6 @@ class MainWindow(QMainWindow):
             fps = self.fps_spinbox.value()
             resolution = self.resolution_combo.currentText()
             if resolution == "Custom":
-                # Usar los valores personalizados
                 width = self.custom_width.value()
                 height = self.custom_height.value()
                 resolution = f"{width}x{height}"
@@ -466,10 +522,10 @@ class MainWindow(QMainWindow):
             }
             codec = codec_map.get(self.codec_combo.currentText(), "libx264")
 
-            # Procesar toda la secuencia con los ajustes actuales (solo durante la exportación)
-            # Esto se hace en un hilo separado para no bloquear la UI
+            # Procesar toda la secuencia con los ajustes actuales
             threading.Thread(target=self.process_and_export,
-                             args=(output_path, fps, resolution, codec)).start()
+                             args=(output_path, fps, resolution, codec),
+                             daemon=True).start()
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
@@ -525,24 +581,19 @@ class MainWindow(QMainWindow):
 
     def export_error(self, error_message):
         self.progress_bar.setVisible(False)
-        self.cancel_button.setVisible(False)
+        self.cancel_button.setFalse(False)
         self.btn_export.setEnabled(True)
 
         QMessageBox.critical(self, "Error", f"Error al exportar: {error_message}")
         self.status_bar.showMessage("Error al exportar el timelapse")
 
     def cancel_export(self):
-        if hasattr(self, 'export_thread') and self.export_thread.isRunning():
-            self.export_thread.terminate()
-            self.export_thread.wait()
-            self.progress_bar.setVisible(False)
-            self.cancel_button.setVisible(False)
-            self.btn_export.setEnabled(True)
-            self.status_bar.showMessage("Exportación cancelada")
+        # Esta función necesita ser implementada si quieres cancelar exportaciones
+        pass
 
     def show_about(self):
         QMessageBox.about(self, "Acerca de Timelapse Creator",
-                          "Timelapse Creator v0.1\n\n"
+                          "Timelapse Creator v1.0\n\n"
                           "Una aplicación para crear timelapses a partir de secuencias de imágenes RAW o JPEG.")
 
     def keyPressEvent(self, event):
@@ -593,119 +644,12 @@ class MainWindow(QMainWindow):
                 self.thumbnail_view.scroll_area.ensureWidgetVisible(thumbnail_button)
                 break
 
-    def schedule_processing(self):
-        """Programa el procesamiento de la imagen con un pequeño retraso"""
-        if not self.image_sequence:
-            return
-
-        # Incrementar el ID de procesamiento
-        self.current_processing_id += 1
-        current_id = self.current_processing_id
-
-        # Usar un temporizador para procesar después de una pausa en los ajustes
-        current_time = time.time()
-
-        # Si ha pasado menos de 0.1 segundos desde el último cambio, esperar
-        if current_time - self.last_processing_time < 0.1:
-            self.pending_processing = True
-            # Usar un QTimer para procesar después de una pausa
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(100, lambda: self.process_image_delayed(current_id))
-        else:
-            self.process_image(current_id)
-
-        self.last_processing_time = current_time
-
-    def process_image_delayed(self, processing_id):
-        """Procesa la imagen después de una pausa en los ajustes"""
-        if self.pending_processing and processing_id == self.current_processing_id:
-            self.process_image(processing_id)
-            self.pending_processing = False
-
-    def process_image(self, processing_id):
-        """Inicia el procesamiento de la imagen en segundo plano"""
-        if not self.image_sequence or self.current_frame_index >= len(self.image_sequence):
-            return
-
-        # Obtener los valores actuales de los sliders
-        exposure = self.exposure_slider.value() / 100.0
-        contrast = self.contrast_slider.value() / 100.0
-
-        # Configurar y ejecutar el hilo de procesamiento
-        image_path = self.image_sequence[self.current_frame_index]
-        self.processor_thread.set_parameters(image_path, exposure, contrast, processing_id)
-
-        # Solo iniciar el hilo si no está en ejecución
-        if not self.processor_thread.isRunning():
-            self.processor_thread.start()
-
-    def on_processing_done(self, result):
-        """Maneja la finalización del procesamiento de la imagen"""
-        processed_image, processing_id = result
-
-        # Solo actualizar si este es el resultado más reciente
-        if processing_id == self.current_processing_id:
-            self.preview_widget.set_image(processed_image)
-
-    def on_processing_error(self, error_message):
-        """Maneja errores en el procesamiento de la imagen"""
-        self.status_bar.showMessage(error_message)
-
-    def update_preview_only(self):
-        """Actualiza solo la previsualización con los ajustes actuales"""
-        if not self.image_sequence:
-            return
-
-        # Obtener valores actuales
-        exposure = self.exposure_slider.value() / 100.0
-        contrast = self.contrast_slider.value() / 100.0
-
-        # Guardar para usar durante la exportación
-        self.current_exposure = exposure
-        self.current_contrast = contrast
-
-        # Procesar solo la imagen actual para previsualización
-        self.update_current_preview()
-
-    def update_current_preview(self):
-        """Actualiza la previsualización de la imagen actual con los ajustes"""
-        if not self.image_sequence or self.current_frame_index >= len(self.image_sequence):
-            return
-
-        image_path = self.image_sequence[self.current_frame_index]
-
-        try:
-            # Cargar y procesar la imagen actual
-            exposure = self.current_exposure
-            contrast = self.current_contrast
-
-            # Procesar en un hilo para no bloquear la UI
-            threading.Thread(target=self.process_preview_image,
-                             args=(image_path, exposure, contrast)).start()
-        except Exception as e:
-            print(f"Error al actualizar previsualización: {e}")
-
-    def process_preview_image(self, image_path, exposure, contrast):
-        """Procesa una imagen para previsualización en un hilo secundario"""
-        try:
-            # Procesar la imagen
-            processed_image = self.processor.adjust_image(image_path, exposure, contrast)
-
-            # Actualizar la UI en el hilo principal
-            if processed_image is not None:
-                QApplication.instance().postEvent(
-                    self,
-                    PreviewUpdateEvent(processed_image, os.path.basename(image_path),
-                                       processed_image.shape[1], processed_image.shape[0])
-                )
-        except Exception as e:
-            print(f"Error en procesamiento de previsualización: {e}")
-
     def show_current_frame(self):
         if self.image_sequence and self.current_frame_index < len(self.image_sequence):
             image_path = self.image_sequence[self.current_frame_index]
             self.preview_widget.load_image(image_path)
             self.highlight_current_thumbnail()
+            self.update_navigation_buttons()
 
             # Reiniciar los sliders a cero cuando cambiamos de imagen
             self.exposure_slider.setValue(0)
@@ -736,27 +680,3 @@ class MainWindow(QMainWindow):
             else:
                 self.status_bar.showMessage("Error al exportar")
                 QMessageBox.critical(self, "Error", event.message)
-
-# Eventos personalizados para comunicación entre hilos
-class PreviewUpdateEvent(QEvent):
-    def __init__(self, image, filename, width, height):
-        super().__init__(QEvent.Type(UserEvent))
-        self.image = image
-        self.filename = filename
-        self.width = width
-        self.height = height
-
-class StatusUpdateEvent(QEvent):
-    def __init__(self, message, progress):
-        super().__init__(QEvent.Type(UserEvent + 1))
-        self.message = message
-        self.progress = progress
-
-class ExportFinishedEvent(QEvent):
-    def __init__(self, success, message):
-        super().__init__(QEvent.Type(UserEvent + 2))
-        self.success = success
-        self.message = message
-
-# Definir tipos de eventos personalizados
-UserEvent = QEvent.Type(QEvent.registerEventType())
