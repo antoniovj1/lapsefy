@@ -34,6 +34,11 @@ class PreviewWidget(QWidget):
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(640, 480)
+        self.image_label.setFrameStyle(QLabel.NoFrame)
+        # --- CAMBIO REALIZADO: Fondo transparente ---
+        # Esto asegura que no se muestre ningún color de fondo alrededor
+        # de la imagen, eliminando la línea lateral.
+        self.image_label.setStyleSheet("background-color: transparent;")
 
         self.loading_label = QLabel()
         self.loading_label.setAlignment(Qt.AlignCenter)
@@ -47,21 +52,19 @@ class PreviewWidget(QWidget):
         main_layout.addLayout(self.stacked_layout, 1)
 
     def show_loading(self):
-        """Muestra el mensaje de carga y comienza la animación."""
         self.dot_count = 0
         self.loading_label.setText("Cargando")
         self.stacked_layout.setCurrentWidget(self.loading_label)
         self.loading_animation_timer.start()
 
     def animate_loading_text(self):
-        """Anima los puntos suspensivos del mensaje de carga."""
         self.dot_count = (self.dot_count + 1) % 4
         dots = "." * self.dot_count
         self.loading_label.setText(f"Cargando{dots}")
 
     def set_image(self, image, filename="", width=0, height=0):
-        """Muestra una imagen, deteniendo la animación de carga."""
         self.loading_animation_timer.stop()
+        self.image_label.clear()
         try:
             self.filename_label.setText(f"Archivo: {filename}")
             if width > 0 and height > 0:
@@ -88,10 +91,7 @@ class PreviewWidget(QWidget):
         self.stacked_layout.setCurrentWidget(self.image_label)
 
     def update_pixmap_scaling(self):
-        """Reescala el pixmap actual al tamaño del label."""
         if self.current_pixmap:
-            # --- CAMBIO REALIZADO: Corrección del error ---
-            # Se usa el tamaño del QLabel para el escalado, que es el contenedor final.
             scaled_pixmap = self.current_pixmap.scaled(
                 self.image_label.size(),
                 Qt.KeepAspectRatio,
@@ -100,6 +100,5 @@ class PreviewWidget(QWidget):
             self.image_label.setPixmap(scaled_pixmap)
 
     def resizeEvent(self, event):
-        """Maneja el redimensionamiento del widget."""
         super().resizeEvent(event)
         self.update_pixmap_scaling()
