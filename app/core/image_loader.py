@@ -14,7 +14,7 @@ class ImageLoader(QObject):
 
     def load_images(self, folder):
         """Carga imágenes desde una carpeta en un hilo separado"""
-        supported_formats = ['.jpg', '.jpeg', '.png', '.tiff', '.raw', '.cr2', '.nef', '.arw']
+        supported_formats = ['.jpg', '.jpeg', '.png', '.tiff', '.raw', '.cr2', '.nef', '.arw', '.raf']
         image_files = []
 
         # Obtener lista de archivos
@@ -27,34 +27,17 @@ class ImageLoader(QObject):
                     image_files.append(os.path.join(folder, file))
 
                 # Emitir progreso
-                progress = int((i / total_files) * 100)
-                self.progress_updated.emit(progress, f"Explorando archivos: {i}/{total_files}")
+                progress = int(((i + 1) / total_files) * 50)  # La exploración es la primera mitad
+                self.progress_updated.emit(progress, f"Explorando archivos: {i + 1}/{total_files}")
 
         except Exception as e:
             self.progress_updated.emit(0, f"Error al explorar carpeta: {str(e)}")
             self.finished.emit([])
             return
 
-        # Ordenar archivos
+        # Ordenar archivos por nombre
         image_files.sort()
 
-        # Verificar que las imágenes se pueden cargar
-        valid_images = []
-        total_images = len(image_files)
-
-        for i, image_path in enumerate(image_files):
-            try:
-                # Intentar cargar la imagen para verificar que es válida
-                img = cv2.imread(image_path)
-                if img is not None:
-                    valid_images.append(image_path)
-
-                # Emitir progreso
-                progress = int((i / total_images) * 100)
-                self.progress_updated.emit(progress, f"Verificando imágenes: {i}/{total_images}")
-
-            except Exception as e:
-                print(f"Error al verificar imagen {image_path}: {e}")
-
-        self.progress_updated.emit(100, f"Carga completada: {len(valid_images)} imágenes")
-        self.finished.emit(valid_images)
+        # Emitir progreso final y lista de archivos
+        self.progress_updated.emit(100, f"Carga completada: {len(image_files)} imágenes encontradas.")
+        self.finished.emit(image_files)

@@ -8,15 +8,14 @@ from PySide6.QtCore import QObject, Signal
 class Deflickerer(QObject):
     progress_updated = Signal(int)
 
-    def __init__(self, window_size=10):
+    def __init__(self):
         super().__init__()
-        self.window_size = window_size
         self.processor = ImageProcessor()
+        self.brightness_curve = []
 
     def calculate_brightness(self, image):
         """Calcula el brillo promedio de una imagen"""
         if len(image.shape) == 3:
-            # Convertir a escala de grises si es color
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
@@ -24,48 +23,56 @@ class Deflickerer(QObject):
 
     def get_brightness_curve(self, image_sequence):
         """Calcula la curva de brillo para una secuencia de imágenes"""
-        brightness_values = []
+        self.brightness_curve = []
         total = len(image_sequence)
 
         for i, image_path in enumerate(image_sequence):
             image = self.processor.load_image(image_path)
+            if image is None:
+                continue
             brightness = self.calculate_brightness(image)
-            brightness_values.append(brightness)
+            self.brightness_curve.append(brightness)
 
-            # Emitir progreso (25% del proceso total es calcular el brillo)
-            progress = int((i / total) * 25)
+            progress = int(((i + 1) / total) * 100)
             self.progress_updated.emit(progress)
 
-        return brightness_values
+        return self.brightness_curve
 
-    def smooth_curve(self, values):
-        """Suaviza una curva usando media móvil"""
-        smoothed = []
-        for i in range(len(values)):
-            start = max(0, i - self.window_size // 2)
-            end = min(len(values), i + self.window_size // 2 + 1)
-            window = values[start:end]
-            smoothed.append(sum(window) / len(window))
-        return smoothed
+    def get_smoothed_curve(self, window_size=10):
+        """Suaviza la curva de brillo usando una media móvil"""
+        if not self.brightness_curve:
+            return []
 
-    def process_sequence(self, image_sequence):
-        """Aplica deflickering a una secuencia de imágenes"""
-        # Calcular curva de brillo original
-        brightness_curve = self.get_brightness_curve(image_sequence)
+        # Asegurar que el tamaño de la ventana sea impar para un centrado adecuado
+        if window_size % 2 == 0:
+            window_size += 1
 
-        # Suavizar la curva
-        smoothed_curve = self.smooth_curve(brightness_curve)
+        smoothed = np.convolve(self.brightness_curve, np.ones(window_size) / window_size, mode='same')
 
-        # Procesar cada imagen
+        # Corregir los bordes que la convolución no maneja bien
+        half_window = window_size // 2
+        for i in range(half_window):
+            smoothed[i] = np.mean(self.brightness_curve[:i + half_window + 1])
+            smoothed[-(i + 1)] = np.mean(self.brightness_curve[-(i + half_window + 1):])
+
+        return smoothed.tolist()
+
+    def apply_correction(self, image_sequence, smoothed_curve):
+        """Aplica la corrección de brillo a la secuencia de imágenes"""
         processed_images = []
         total = len(image_sequence)
 
         for i, image_path in enumerate(image_sequence):
             image = self.processor.load_image(image_path)
+            if image is None:
+                continue
 
             # Calcular factor de corrección
-            if brightness_curve[i] > 0:
-                correction_factor = smoothed_curve[i] / brightness_curve[i]
+            original_brightness = self.brightness_curve[i]
+            target_brightness = smoothed_curve[i]
+
+            if original_brightness > 0:
+                correction_factor = target_brightness / original_brightness
             else:
                 correction_factor = 1.0
 
@@ -75,8 +82,7 @@ class Deflickerer(QObject):
 
             processed_images.append(corrected_image)
 
-            # Emitir progreso (25-100% del proceso total es aplicar corrección)
-            progress = 25 + int((i / total) * 75)
+            progress = int(((i + 1) / total) * 100)
             self.progress_updated.emit(progress)
 
         return processed_images

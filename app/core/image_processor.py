@@ -6,65 +6,72 @@ import rawpy
 
 class ImageProcessor:
     def __init__(self):
-        # Cache para imágenes RAW procesadas
-        self.raw_cache = {}
+        self.preview_cache = {}
+        self.MAX_CACHE_SIZE = 20
 
-    def load_image(self, image_path):
-        """Carga una imagen, soportando formatos RAW y JPEG"""
-        if image_path.lower().endswith(('.raw', '.cr2', '.nef', '.arw')):
-            # Usar cache para imágenes RAW (son lentas de procesar)
-            if image_path in self.raw_cache:
-                return self.raw_cache[image_path].copy()
+    def is_in_cache(self, image_path):
+        """Comprueba si una imagen ya está en el caché."""
+        return image_path in self.preview_cache
 
-            # Procesar imagen RAW
-            with rawpy.imread(image_path) as raw:
-                rgb = raw.postprocess()
-            result = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    def clear_cache(self):
+        """Limpia el caché, útil al cargar una nueva secuencia."""
+        self.preview_cache.clear()
 
-            # Almacenar en cache (limitar el tamaño del cache)
-            if len(self.raw_cache) > 10:
-                self.raw_cache.clear()
-            self.raw_cache[image_path] = result
+    def load_image(self, image_path, use_cache=True):
+        """Carga una imagen, soportando formatos RAW y JPEG, con opción de caché."""
+        if use_cache and image_path in self.preview_cache:
+            return self.preview_cache[image_path].copy()
 
-            return result
-        else:
-            # Cargar imagen normal
-            return cv2.imread(image_path)
+        try:
+            if image_path.lower().endswith(('.raw', '.cr2', '.nef', '.arw', '.raf')):
+                with rawpy.imread(image_path) as raw:
+                    # --- CAMBIO REALIZADO: Consistencia de color ---
+                    # Usar los mismos parámetros que en las miniaturas para colores fieles.
+                    rgb = raw.postprocess(use_camera_wb=True, no_auto_bright=True, output_bps=8)
+                image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            else:
+                image = cv2.imread(image_path)
+
+            if use_cache and image is not None:
+                if len(self.preview_cache) >= self.MAX_CACHE_SIZE:
+                    self.preview_cache.pop(next(iter(self.preview_cache)))
+                self.preview_cache[image_path] = image
+                return image.copy()
+
+            return image
+        except Exception as e:
+            print(f"Error al cargar la imagen {image_path}: {e}")
+            return None
 
     def adjust_image(self, image_path, exposure=0, contrast=0):
-        """Ajusta exposición y contraste de una imagen"""
-        image = self.load_image(image_path)
+        """Ajusta exposición y contraste de una imagen."""
+        # Al ajustar, no usamos el caché para obtener la imagen original
+        image = self.load_image(image_path, use_cache=False)
         return self.adjust_image_from_array(image, exposure, contrast)
 
     def adjust_image_from_array(self, image, exposure=0, contrast=0):
-        """Ajusta exposición y contraste de una imagen desde un array"""
+        """Ajusta exposición y contraste de una imagen desde un array de numpy."""
         if image is None:
             return None
 
-        # Hacer una copia para no modificar la original
         result = image.copy().astype(np.float32)
 
-        # Aplicar exposición (forma más eficiente)
         if exposure != 0:
-            # exposure está en el rango [-1, 1] después de dividir por 100
-            result = result * (2.0 ** exposure)
+            result = np.clip(result * (2.0 ** exposure), 0, 255)
 
-        # Aplicar contraste (forma más eficiente)
         if contrast != 0:
-            # contrast está en el rango [-1, 1] después de dividir por 100
-            mean = np.mean(result, axis=(0, 1))
-            result = (result - mean) * (1.0 + contrast) + mean
+            factor = (1.0 + contrast)
+            mean = np.mean(result, axis=(0, 1), keepdims=True)
+            result = np.clip((result - mean) * factor + mean, 0, 255)
 
-        # Asegurar que los valores estén en el rango correcto
-        result = np.clip(result, 0, 255).astype(np.uint8)
-
-        return result
+        return result.astype(np.uint8)
 
     def process_sequence(self, image_paths, exposure=0, contrast=0):
         """Procesa una secuencia completa de imágenes con los ajustes dados"""
         processed_images = []
         for image_path in image_paths:
-            processed_image = self.adjust_image(image_path, exposure, contrast)
+            original_image = self.load_image(image_path, use_cache=True)
+            processed_image = self.adjust_image_from_array(original_image, exposure, contrast)
             if processed_image is not None:
                 processed_images.append(processed_image)
         return processed_images
